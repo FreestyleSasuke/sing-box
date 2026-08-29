@@ -8,6 +8,8 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -26,12 +28,19 @@ import (
 )
 
 type acmeWrapper struct {
-	ctx           context.Context
-	cfg           *certmagic.Config
-	cache         *certmagic.Cache
-	zapLogger     *zap.Logger
-	dataDirectory string
-	domain        []string
+	ctx               context.Context
+	cfg               *certmagic.Config
+	cache             *certmagic.Cache
+	zapLogger         *zap.Logger
+	dataDirectory     string
+	staticDomain      []string
+	domain            []string
+	checkIP           bool
+	checkIPURL        string
+	checkIPInterval   time.Duration
+	checkIPVersion    option.ACMEIPCheckVersion
+	configuredDefault string
+	access            sync.Mutex
 }
 
 func (w *acmeWrapper) Start() error {
@@ -51,7 +60,83 @@ func (w *acmeWrapper) Start() error {
 	config = certmagic.New(cache, *config)
 	w.cfg = config
 	w.cache = cache
+	if w.checkIP {
+		err := w.refreshWANIPCertificates(true)
+		if err != nil {
+			return err
+		}
+		go w.loopWANIPCheck()
+		return nil
+	}
 	return w.cfg.ManageSync(w.ctx, w.domain)
+}
+
+func (w *acmeWrapper) loopWANIPCheck() {
+	interval := w.checkIPInterval
+	if interval <= 0 {
+		interval = ACMERenewalWatchInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-w.ctx.Done():
+			return
+		case <-ticker.C:
+			if w.checkIPInterval <= 0 {
+				w.access.Lock()
+				managed := append([]string{}, w.domain...)
+				w.access.Unlock()
+				if !ManagedCertificatesNeedRenewal(w.cache, w.cfg, managed) {
+					continue
+				}
+			}
+			err := w.refreshWANIPCertificates(false)
+			if err != nil {
+				w.zapLogger.Warn("refresh WAN IP certificates: " + err.Error())
+			}
+		}
+	}
+}
+
+func (w *acmeWrapper) refreshWANIPCertificates(initial bool) error {
+	discovery, err := DiscoverWANIPsDetailed(w.ctx, w.checkIPURL, w.checkIPVersion)
+	if err != nil {
+		return err
+	}
+	for i, family := range discovery.FailedFamilies {
+		msg := "WAN IP lookup failed for address family " + family + "; keeping any stored certificate for that family"
+		if i < len(discovery.FamilyErrors) && discovery.FamilyErrors[i] != nil {
+			w.zapLogger.Warn(msg + ": " + discovery.FamilyErrors[i].Error())
+		} else {
+			w.zapLogger.Warn(msg)
+		}
+	}
+	w.access.Lock()
+	previous := append([]string{}, w.domain...)
+	stored := MergeACMESubjects(previous, StoredIPSubjects(w.ctx, w.cfg.Storage))
+	wanIPs := FillMissingWANIPFamilies(discovery.IPs, stored, w.checkIPVersion)
+	next := MergeACMESubjects(w.staticDomain, wanIPs)
+	if !initial && SameACMESubjectSet(previous, next) {
+		w.access.Unlock()
+		return nil
+	}
+	w.domain = next
+	if w.configuredDefault == "" {
+		if ipName := FirstIPSubject(next); ipName != "" {
+			w.cfg.DefaultServerName = ipName
+		}
+	}
+	w.access.Unlock()
+	err = w.cfg.ManageAsync(w.ctx, next)
+	if err != nil {
+		return err
+	}
+	stale := StaleACMESubjects(previous, next)
+	if len(stale) == 0 {
+		return nil
+	}
+	return CleanupStaleACMECertificates(w.ctx, w.cfg.Storage, w.cache, stale)
 }
 
 func (w *acmeWrapper) Close() error {
@@ -62,10 +147,20 @@ func (w *acmeWrapper) Close() error {
 }
 
 func (w *acmeWrapper) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	w.access.Lock()
+	managed := append([]string{}, w.domain...)
+	w.access.Unlock()
+	if name := ManagedNameForHello(hello, managed); name != "" {
+		hello = HelloWithCertificateName(hello, name)
+	}
 	return w.cfg.GetCertificate(hello)
 }
 
 func startACME(ctx context.Context, logger logger.Logger, options option.InboundACMEOptions) (*tls.Config, adapter.SimpleLifecycle, error) {
+	checkIPURL, checkIPInterval, err := NormalizeACMECheckIPOptions(options.CheckIP, options.CheckIPURL, options.CheckIPInterval, options.Domain)
+	if err != nil {
+		return nil, nil, err
+	}
 	var acmeServer string
 	switch options.Provider {
 	case "", "letsencrypt":
@@ -101,7 +196,7 @@ func startACME(ctx context.Context, logger logger.Logger, options option.Inbound
 		Logger:            zapLogger,
 	}
 	profile := options.Profile
-	if profile == "" && acmeServer == certmagic.LetsEncryptProductionCA && slices.ContainsFunc(options.Domain, certmagic.SubjectIsIP) {
+	if profile == "" && acmeServer == certmagic.LetsEncryptProductionCA && (options.CheckIP || slices.ContainsFunc(options.Domain, certmagic.SubjectIsIP)) {
 		profile = "shortlived"
 	}
 
@@ -150,11 +245,17 @@ func startACME(ctx context.Context, logger logger.Logger, options option.Inbound
 	}
 	config.Issuers = []certmagic.Issuer{certmagic.NewACMEIssuer(config, acmeConfig)}
 	wrapper := &acmeWrapper{
-		ctx:           ctx,
-		cfg:           config,
-		zapLogger:     zapLogger,
-		dataDirectory: dataDirectory,
-		domain:        options.Domain,
+		ctx:               ctx,
+		cfg:               config,
+		zapLogger:         zapLogger,
+		dataDirectory:     dataDirectory,
+		staticDomain:      append([]string{}, options.Domain...),
+		domain:            append([]string{}, options.Domain...),
+		checkIP:           options.CheckIP,
+		checkIPURL:        checkIPURL,
+		checkIPInterval:   checkIPInterval,
+		checkIPVersion:    options.CheckIPVersion,
+		configuredDefault: options.DefaultServerName,
 	}
 	var tlsConfig *tls.Config
 	if acmeConfig.DisableTLSALPNChallenge || acmeConfig.DNS01Solver != nil {

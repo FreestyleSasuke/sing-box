@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -48,18 +49,26 @@ var (
 
 type Service struct {
 	certificate.Adapter
-	ctx           context.Context
-	config        *certmagic.Config
-	cache         *certmagic.Cache
-	zapLogger     *zap.Logger
-	dataDirectory string
-	domain        []string
-	nextProtos    []string
+	ctx               context.Context
+	config            *certmagic.Config
+	cache             *certmagic.Cache
+	zapLogger         *zap.Logger
+	dataDirectory     string
+	staticDomain      []string
+	domain            []string
+	nextProtos        []string
+	checkIP           bool
+	checkIPURL        string
+	checkIPInterval   time.Duration
+	checkIPVersion    option.ACMEIPCheckVersion
+	configuredDefault string
+	access            sync.Mutex
 }
 
 func NewCertificateProvider(ctx context.Context, logger log.ContextLogger, tag string, options option.ACMECertificateProviderOptions) (adapter.CertificateProviderService, error) {
-	if len(options.Domain) == 0 {
-		return nil, E.New("missing domain")
+	checkIPURL, checkIPInterval, err := boxtls.NormalizeACMECheckIPOptions(options.CheckIP, options.CheckIPURL, options.CheckIPInterval, options.Domain)
+	if err != nil {
+		return nil, err
 	}
 	var acmeServer string
 	switch options.Provider {
@@ -122,7 +131,7 @@ func NewCertificateProvider(ctx context.Context, logger log.ContextLogger, tag s
 	}
 
 	profile := options.Profile
-	if profile == "" && acmeServer == certmagic.LetsEncryptProductionCA && slices.ContainsFunc(options.Domain, certmagic.SubjectIsIP) {
+	if profile == "" && acmeServer == certmagic.LetsEncryptProductionCA && (options.CheckIP || slices.ContainsFunc(options.Domain, certmagic.SubjectIsIP)) {
 		profile = "shortlived"
 	}
 
@@ -176,13 +185,19 @@ func NewCertificateProvider(ctx context.Context, logger log.ContextLogger, tag s
 		nextProtos = []string{C.ACMETLS1Protocol}
 	}
 	return &Service{
-		Adapter:       certificate.NewAdapter(C.TypeACME, tag),
-		ctx:           ctx,
-		config:        config,
-		zapLogger:     zapLogger,
-		dataDirectory: dataDirectory,
-		domain:        options.Domain,
-		nextProtos:    nextProtos,
+		Adapter:           certificate.NewAdapter(C.TypeACME, tag),
+		ctx:               ctx,
+		config:            config,
+		zapLogger:         zapLogger,
+		dataDirectory:     dataDirectory,
+		staticDomain:      append([]string{}, options.Domain...),
+		domain:            append([]string{}, options.Domain...),
+		nextProtos:        nextProtos,
+		checkIP:           options.CheckIP,
+		checkIPURL:        checkIPURL,
+		checkIPInterval:   checkIPInterval,
+		checkIPVersion:    options.CheckIPVersion,
+		configuredDefault: options.DefaultServerName,
 	}, nil
 }
 
@@ -206,9 +221,87 @@ func (s *Service) Start(stage adapter.StartStage) error {
 		s.config = config
 		s.cache = cache
 	case adapter.StartStateStart:
+		if s.checkIP {
+			err := s.refreshWANIPCertificates(true)
+			if err != nil {
+				return err
+			}
+			go s.loopWANIPCheck()
+			return nil
+		}
 		return s.config.ManageAsync(s.ctx, s.domain)
 	}
 	return nil
+}
+
+func (s *Service) loopWANIPCheck() {
+	interval := s.checkIPInterval
+	if interval <= 0 {
+		interval = boxtls.ACMERenewalWatchInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			if s.checkIPInterval <= 0 {
+				s.access.Lock()
+				managed := append([]string{}, s.domain...)
+				s.access.Unlock()
+				if !boxtls.ManagedCertificatesNeedRenewal(s.cache, s.config, managed) {
+					continue
+				}
+			}
+			err := s.refreshWANIPCertificates(false)
+			if err != nil {
+				s.zapLogger.Warn("refresh WAN IP certificates", zap.Error(err))
+			}
+		}
+	}
+}
+
+func (s *Service) refreshWANIPCertificates(initial bool) error {
+	discovery, err := boxtls.DiscoverWANIPsDetailed(s.ctx, s.checkIPURL, s.checkIPVersion)
+	if err != nil {
+		return err
+	}
+	for i, family := range discovery.FailedFamilies {
+		fields := []zap.Field{zap.String("family", family), zap.String("url", s.checkIPURL)}
+		if i < len(discovery.FamilyErrors) && discovery.FamilyErrors[i] != nil {
+			fields = append(fields, zap.Error(discovery.FamilyErrors[i]))
+		}
+		s.zapLogger.Warn("WAN IP lookup failed for address family; keeping any stored certificate for that family", fields...)
+	}
+	s.access.Lock()
+	previous := append([]string{}, s.domain...)
+	stored := boxtls.MergeACMESubjects(previous, boxtls.StoredIPSubjects(s.ctx, s.config.Storage))
+	wanIPs := boxtls.FillMissingWANIPFamilies(discovery.IPs, stored, s.checkIPVersion)
+	next := boxtls.MergeACMESubjects(s.staticDomain, wanIPs)
+	if !initial && boxtls.SameACMESubjectSet(previous, next) {
+		s.access.Unlock()
+		return nil
+	}
+	s.domain = next
+	if s.configuredDefault == "" {
+		if ipName := boxtls.FirstIPSubject(next); ipName != "" {
+			s.config.DefaultServerName = ipName
+		}
+	}
+	s.access.Unlock()
+
+	s.zapLogger.Info("managing ACME certificates for WAN IP", zap.Strings("domain", next))
+	err = s.config.ManageAsync(s.ctx, next)
+	if err != nil {
+		return err
+	}
+	stale := boxtls.StaleACMESubjects(previous, next)
+	if len(stale) == 0 {
+		return nil
+	}
+	s.zapLogger.Info("removing stale ACME certificates", zap.Strings("domain", stale))
+	return boxtls.CleanupStaleACMECertificates(s.ctx, s.config.Storage, s.cache, stale)
 }
 
 func (s *Service) Close() error {
@@ -219,6 +312,12 @@ func (s *Service) Close() error {
 }
 
 func (s *Service) GetCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	s.access.Lock()
+	managed := append([]string{}, s.domain...)
+	s.access.Unlock()
+	if name := boxtls.ManagedNameForHello(hello, managed); name != "" {
+		hello = boxtls.HelloWithCertificateName(hello, name)
+	}
 	return s.config.GetCertificate(hello)
 }
 

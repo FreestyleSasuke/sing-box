@@ -28,6 +28,10 @@ type ACMECertificateProviderOptions struct {
 	KeyType                 ACMEKeyType                        `json:"key_type,omitempty" enum:"ed25519,p256,p384,rsa2048,rsa4096"`
 	Profile                 string                             `json:"profile,omitempty"`
 	HTTPClient              *HTTPClientOptions                 `json:"http_client,omitempty"`
+	CheckIP                 bool                               `json:"check_ip,omitempty"`
+	CheckIPInterval         badoption.Duration                 `json:"check_ip_interval,omitempty"`
+	CheckIPURL              string                             `json:"check_ip_url,omitempty"`
+	CheckIPVersion          ACMEIPCheckVersion                 `json:"check_ip_version,omitempty" enum:"4,6,both"`
 }
 
 type _ACMEProviderDNS01ChallengeOptions struct {
@@ -122,4 +126,44 @@ func (t *ACMEKeyType) UnmarshalJSON(data []byte) error {
 
 func (t ACMEKeyType) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
 	return schema.StringEnum("", "ed25519", "p256", "p384", "rsa2048", "rsa4096"), nil
+}
+
+// ACMEIPCheckVersion selects which WAN address family is discovered for IP certificates.
+type ACMEIPCheckVersion string
+
+const (
+	ACMEIPCheckVersionIPv4 ACMEIPCheckVersion = "4"
+	ACMEIPCheckVersionIPv6 ACMEIPCheckVersion = "6"
+	ACMEIPCheckVersionBoth ACMEIPCheckVersion = "both"
+)
+
+func (t *ACMEIPCheckVersion) UnmarshalJSON(data []byte) error {
+	var value string
+	err := json.Unmarshal(data, &value)
+	if err != nil {
+		return err
+	}
+	value = strings.ToLower(strings.TrimSpace(value))
+	switch ACMEIPCheckVersion(value) {
+	case "", ACMEIPCheckVersionIPv4, ACMEIPCheckVersionIPv6, ACMEIPCheckVersionBoth:
+		*t = ACMEIPCheckVersion(value)
+	default:
+		return E.New("unknown ACME check_ip_version: ", value)
+	}
+	return nil
+}
+
+func (t ACMEIPCheckVersion) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+	return schema.StringEnum("", "4", "6", "both"), nil
+}
+
+func (t ACMEIPCheckVersion) Families() []string {
+	switch t {
+	case ACMEIPCheckVersionIPv6:
+		return []string{"6"}
+	case ACMEIPCheckVersionBoth:
+		return []string{"4", "6"}
+	default:
+		return []string{"4"}
+	}
 }

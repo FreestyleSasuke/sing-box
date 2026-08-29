@@ -24,6 +24,10 @@ type InboundACMEOptions struct {
 	ExternalAccount         *ACMEExternalAccountOptions `json:"external_account,omitempty"`
 	DNS01Challenge          *ACMEDNS01ChallengeOptions  `json:"dns01_challenge,omitempty"`
 	Profile                 string                      `json:"profile,omitempty"`
+	CheckIP                 bool                        `json:"check_ip,omitempty"`
+	CheckIPInterval         badoption.Duration          `json:"check_ip_interval,omitempty"`
+	CheckIPURL              string                      `json:"check_ip_url,omitempty"`
+	CheckIPVersion          ACMEIPCheckVersion          `json:"check_ip_version,omitempty" enum:"4,6,both"`
 }
 
 type ACMEExternalAccountOptions struct {
