@@ -68,6 +68,7 @@ import (
 var (
 	_ adapter.OutboundWithPreferredRoutes = (*Endpoint)(nil)
 	_ adapter.InterfaceUpdateListener     = (*Endpoint)(nil)
+	_ adapter.Referrer                    = (*Endpoint)(nil)
 	_ dialer.PacketDialerWithDestination  = (*Endpoint)(nil)
 	_ tun.Port                            = (*Endpoint)(nil)
 )
@@ -89,6 +90,7 @@ type Endpoint struct {
 	dnsRouter         adapter.DNSRouter
 	network           adapter.NetworkManager
 	platformInterface adapter.PlatformInterface
+	detour            string
 	server            *tsnet.Server
 	stack             *stack.Stack
 	icmpForwarder     *tun.ICMPForwarder
@@ -200,6 +202,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		queryOptions:      dialerQueryOptions,
 		network:           service.FromContext[adapter.NetworkManager](ctx),
 		platformInterface: platformInterface,
+		detour:            options.Detour,
 		server: &tsnet.Server{
 			Dir:      stateDirectory,
 			Hostname: hostname,
@@ -249,6 +252,13 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		systemInterfaceMTU:         options.SystemInterfaceMTU,
 		keyAuth:                    options.AuthKey != "",
 	}, nil
+}
+
+func (t *Endpoint) References() []string {
+	if t.detour == "" {
+		return nil
+	}
+	return []string{t.detour}
 }
 
 func (t *Endpoint) Start(stage adapter.StartStage) error {
@@ -953,7 +963,7 @@ func (t *Endpoint) PreferredDomain(metadata *adapter.InboundContext, domain stri
 		}
 	}
 	for _, suffix := range t.routeSuffixes.Load() {
-		if mDNS.IsSubDomain(suffix, domain) {
+		if matchDomainSuffix(domain, suffix) {
 			return true
 		}
 	}
@@ -1000,7 +1010,7 @@ func (t *Endpoint) onReconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCf
 	}
 	routeSuffixes := make([]string, 0, len(dnsCfg.Routes))
 	for fqdn := range dnsCfg.Routes {
-		routeSuffixes = append(routeSuffixes, fqdn.WithoutTrailingDot())
+		routeSuffixes = append(routeSuffixes, strings.ToLower(fqdn.WithoutTrailingDot()))
 	}
 	t.routeDomains.Store(routeDomains)
 	t.routeSuffixes.Store(routeSuffixes)
